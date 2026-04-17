@@ -1328,7 +1328,11 @@ int dcore_iova_mmap(struct file *filp, struct vm_area_struct *vma)
 
 	vma->vm_ops = &dcore_vma_ops;
 	vma->vm_private_data = (void *)vm_ctx;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP | VM_PFNMAP);
+#else
 	vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP | VM_PFNMAP;
+#endif
 
 	return 0;
 
