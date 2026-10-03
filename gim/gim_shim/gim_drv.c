@@ -43,6 +43,7 @@ struct gim_init_thread_context {
 	const void *ent;
 	uint32_t gpu_id;
 	void *init_thread;
+	int init_ret;
 };
 
 static struct gim_init_thread_context gim_init_thread[AMDGV_MAX_GPU_NUM];
@@ -476,12 +477,13 @@ static int gim_init_thread_func(void *context)
 	if (dev_data->adev == AMDGV_INVALID_HANDLE) {
 		gim_put_error(AMDGV_LOG_DRIVER_DEV_INIT_FAIL,
 			PCI_DEVID(pdev->bus->number, pdev->devfn));
+		ret = -EIO;
+		goto err_pci_unmap;
 	}
-	if (dev_data->adev != AMDGV_INVALID_HANDLE) {
-		/* Initialize the SVM status by calling the function once */
-		g_svm_status = amdgv_is_service_vm_enabled(dev_data->adev) ?
-				SVM_STATUS_ENABLED : SVM_STATUS_DISABLED;
-	}
+
+	/* Initialize the SVM status by calling the function once */
+	g_svm_status = amdgv_is_service_vm_enabled(dev_data->adev) ?
+			SVM_STATUS_ENABLED : SVM_STATUS_DISABLED;
 
 	if ((dev_data->adev != AMDGV_INVALID_HANDLE) && !SVM_ENABLED(dev_data->adev)) {
 		if (gim_build_vfs_map(dev_data))
@@ -529,10 +531,12 @@ static int gim_init_thread_func(void *context)
 
 err_pci_unmap:
 	gim_release_pci_res(data, pdev);
+	pci_disable_device(pdev);
 err_mem_free:
 	devm_kfree(&pdev->dev, dev_data);
 out:
 	atomic64_dec(&gim_gpu_initing_num);
+	init_context->init_ret = ret;
 	complete(&gim_gpu_init_event);
 	init_context->init_thread = NULL;
 	return ret;
@@ -588,17 +592,21 @@ static int gim_probe(struct pci_dev *pdev,
 
 	if (gpu_id >= AMDGV_MAX_GPU_NUM) {
 		gim_warn("gpu_id is %u > AMDGV_MAX_GPU_NUM(32)\n", gpu_id);
+		ret = -ENOSPC;
 		goto err_out;
 	}
 
 	gim_init_thread[gpu_id].gpu_id = gpu_id;
 	gim_init_thread[gpu_id].ent = ent;
 	gim_init_thread[gpu_id].pdev = pdev;
+	gim_init_thread[gpu_id].init_ret = -EINPROGRESS;
 	gim_init_thread[gpu_id].init_thread = kthread_run(gim_init_thread_func,
 			(void *)&gim_init_thread[gpu_id], "gpu_init_thread");
 
 	if (IS_ERR(gim_init_thread[gpu_id].init_thread)) {
 		gim_warn("failed to create gpu init thread!\n");
+		ret = PTR_ERR(gim_init_thread[gpu_id].init_thread);
+		gim_init_thread[gpu_id].init_thread = NULL;
 		goto err_out;
 	}
 
@@ -874,6 +882,8 @@ static int gim_init(void)
 
 	for (i = 0; i < AMDGV_MAX_GPU_NUM; i++)
 		gim_init_thread[i].init_thread = NULL;
+	for (i = 0; i < AMDGV_MAX_GPU_NUM; i++)
+		gim_init_thread[i].init_ret = 0;
 
 	flags = 0;
 	mutex_init(&gim_device_list_lock);
@@ -919,6 +929,15 @@ static int gim_init(void)
 	while (atomic64_read(&gim_gpu_initing_num) != 0)
 		wait_for_completion_interruptible_timeout(&gim_gpu_init_event,
 					usecs_to_jiffies(1000));
+
+	for (i = 0; i < gim_gpu_id; i++) {
+		if (gim_init_thread[i].init_ret < 0) {
+			gim_warn("GPU %u failed asynchronous initialization (%d)\n",
+				i, gim_init_thread[i].init_ret);
+			ret = -EIO;
+			goto err_probe;
+		}
+	}
 
 	ret = gim_mon_create_drv_sys(&gim_driver.driver);
 	if (ret)
@@ -971,6 +990,7 @@ err_create_gurad:
 	gim_mon_remove_drv_sys(&gim_driver.driver);
 
 err_create_mon:
+err_probe:
 	pci_unregister_driver(&gim_driver);
 
 err_reg_drv:
@@ -1077,4 +1097,3 @@ MODULE_VERSION(PACKAGE_VERSION);
 MODULE_AUTHOR("Advanced Micro Devices, Inc.");
 MODULE_DESCRIPTION("GPU IOV MODULE");
 MODULE_LICENSE("Dual MIT/GPL");
-

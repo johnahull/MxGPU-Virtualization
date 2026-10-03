@@ -2189,10 +2189,14 @@ struct amdgv_adapter *amdgv_device_internal_init(struct amdgv_init_data *init_da
 	}
 
 	/* device function initialization */
-	if (amdgv_device_func_hw_init(adapt) == 0) {
-		amdgv_device_set_status(adapt, AMDGV_STATUS_HW_INIT);
-		oss_signal_event(adapt->sched.event);
+	ret = amdgv_device_func_hw_init(adapt);
+	if (ret) {
+		amdgv_put_log(AMDGV_PF_IDX, AMDGV_LOG_DRIVER_HW_INIT_FAIL, 0);
+		goto fail;
 	}
+
+	amdgv_device_set_status(adapt, AMDGV_STATUS_HW_INIT);
+	oss_signal_event(adapt->sched.event);
 
 	if (!(adapt->flags & AMDGV_FLAG_GPUV_LIVE_UPDATE)) {
 		if (amdgv_in_live_update_seq()) {
@@ -2211,6 +2215,8 @@ fail:
 	/* Collect the diagnosis data logs */
 	amdgv_diag_data_cache_dump(adapt, AMDGV_PF_IDX,
 				   AMDGV_DIAG_DATA_LOG_COLLECT_CACHE_INIT_FAIL);
+	if (adapt->status == AMDGV_STATUS_SW_INIT)
+		amdgv_device_func_sw_fini(adapt);
 	/* Check within the API if the diagnosis data has initialized */
 	amdgv_diag_data_fini(adapt);
 	/* Check within the API if the diagnosis data has initialized */
