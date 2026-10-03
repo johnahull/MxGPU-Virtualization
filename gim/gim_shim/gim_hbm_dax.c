@@ -11,6 +11,7 @@
 #include <linux/slab.h>
 #include <linux/mm.h>
 #include <linux/errno.h>
+#include <linux/string.h>
 #include "gim_debug.h"
 #include "gim_hbm_dax.h"
 
@@ -96,7 +97,12 @@ void *gim_hbm_dax_init(const char *dev_name,
 	}
 
 	/* Allocate device number */
-	strncpy(gim_hbm_dax->dev_name, dev_name, sizeof(gim_hbm_dax->dev_name));
+	ret = strscpy(gim_hbm_dax->dev_name, dev_name,
+			  sizeof(gim_hbm_dax->dev_name));
+	if (ret < 0) {
+		gim_warn("device name is too long: %s\n", dev_name);
+		goto err_free;
+	}
 	gim_hbm_dax->phy_addr = phy_addr;
 	gim_hbm_dax->phy_size = phy_size;
 	ret = alloc_chrdev_region(&gim_hbm_dax->dev_num, 0, 1, gim_hbm_dax->dev_name);

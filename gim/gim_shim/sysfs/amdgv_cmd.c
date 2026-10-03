@@ -591,8 +591,11 @@ static int amdgv_get_debug_data(struct amdgv_cmd_debug_data_dir_path *input_data
 
 	len = strnlen(input_data->abs_dir_path, AMDGV_CMD_PATH_LEN);
 	if (len > 0 && len < AMDGV_CMD_PATH_LEN) {
-		strncpy(dir_save_path, input_data->abs_dir_path, len);
-		dir_save_path[len] = '\0';
+		if (strscpy(dir_save_path, input_data->abs_dir_path,
+			    sizeof(dir_save_path)) < 0) {
+			ret = -EINVAL;
+			goto out;
+		}
 	} else {
 		ret = -EINVAL;
 		goto out;
@@ -1172,5 +1175,4 @@ void gim_cmd_handler_fini(void)
 	class_destroy(amdgv_class);
 	unregister_chrdev_region(amdgv_dev, AMDGV_CMD_MINOR_COUNT);
 }
-
 
