@@ -23,6 +23,7 @@
 #include "mi300_clockgating.h"
 #include "mi300_gpumon.h"
 #include "mi350/mi350_powerplay.h"
+#include "mi300_psp.h"
 
 #include "mi300/NBIO/nbio_7_9_0_offset.h"
 #include "mi300/NBIO/nbio_7_9_0_sh_mask.h"
@@ -30,6 +31,21 @@
 #include "gfxhub_v1_2.h"
 
 #define MI300_MAX_VF_NUM 8
+
+static enum psp_status mi300_psp_wait_for_bootloader_steady_serialized(
+		struct amdgv_adapter *adapt)
+{
+	enum psp_status ret;
+
+	if (adapt->hive_lock == OSS_INVALID_HANDLE)
+		return mi300_psp_wait_for_bootloader_steady(adapt);
+
+	oss_mutex_lock(adapt->hive_lock);
+	ret = mi300_psp_wait_for_bootloader_steady(adapt);
+	oss_mutex_unlock(adapt->hive_lock);
+
+	return ret;
+}
 
 #define smnBIF_CFG_DEV0_EPF0_VF0_VENDOR_ID 0x10160000
 #define smnBIF_CFG_DEV0_EPF0_VF1_VENDOR_ID 0x10161000
@@ -971,6 +987,8 @@ static int mi300_reset_hw_for_reload(struct amdgv_adapter *adapt, bool is_unload
 	uint32_t bit_s3_int;
 	struct mi300_reset_access_info access_info;
 	struct mi300_whole_gpu_reset_state *reset_state;
+	struct amdgv_hive_info *hive;
+	bool wait_for_psp;
 
 	/* alloc memory for whole GPU reset */
 	reset_state = oss_zalloc(sizeof(struct mi300_whole_gpu_reset_state));
@@ -996,15 +1014,44 @@ static int mi300_reset_hw_for_reload(struct amdgv_adapter *adapt, bool is_unload
 
 	if (adapt->pp.pp_funcs && adapt->pp.pp_funcs->gpu_mode1_reset)
 		ret = adapt->pp.pp_funcs->gpu_mode1_reset(adapt, is_unload);
-	if (ret)
-		goto exit;
 
+	/*
+	 * A mode-1 reset blocks register access until the PF configuration is
+	 * restored.  Restore it even when the reset reports an error so a failed
+	 * unload does not leave the device in a state that cannot be reprobed by
+	 * another driver.
+	 */
 	mi300_reset_restore_pf(adapt, reset_state);
+	mi300_reset_restore_access_info(adapt, &access_info);
+
+	if (ret) {
+		amdgv_reset_restore_sriov(adapt);
+		goto cleanup;
+	}
 
 	/*check mode1 reset finish after restore_pci_config*/
 	ret = mi300_wait_gpu_reset_completion(adapt);
 	if (ret)
-		goto exit;
+		goto cleanup;
+
+	/*
+	 * The PSP boot state is shared by the XGMI hive.  During a reload every
+	 * adapter must reach steady state, but during unload only the last adapter
+	 * needs to wait for the shared PSP.  The PSP hw_fini hook removes the
+	 * adapter from the hive before this callback, so a missing/empty hive is
+	 * the last-adapter case here.  Serialize the poll because the hardware
+	 * reset path can still be entered concurrently during a reload.
+	 */
+	wait_for_psp = !is_unload;
+	if (is_unload) {
+		hive = amdgv_get_xgmi_hive(adapt);
+		wait_for_psp = !hive || hive->number_adapters == 0;
+	}
+	if (wait_for_psp) {
+		ret = mi300_psp_wait_for_bootloader_steady_serialized(adapt);
+		if (ret)
+			goto cleanup;
+	}
 
 	/* disable S3 engine hung state */
 	tmp = bit_s3_int & ~ATOM_S3_ASIC_GUI_ENGINE_HUNG;
@@ -1020,7 +1067,29 @@ static int mi300_reset_hw_for_reload(struct amdgv_adapter *adapt, bool is_unload
 	/* restore mmio protection info after PF_FLR or WHOLE_GPU_RESET */
 	mi300_reset_restore_access_info(adapt, &access_info);
 
-exit:
+	/*
+	 * The whole-GPU reset also resets NBIO's SDMA engine-to-VF routing.  The
+	 * normal GIM init path programs these registers from the VBIOS late-init
+	 * hook, but the unload path has no corresponding late-init pass before
+	 * amdgpu probes the PF again.  Restore the SDMA mapping while the GIM
+	 * adapter still owns the device.  Do not program VCN_TARGET_VF here: that
+	 * register assigns VCN engines to the VF, while the next driver is going
+	 * to probe the PF and needs the post-reset PF/default routing.
+	 */
+	if (adapt->asic_type == CHIP_MI308X)
+		mi308_nbio_assign_sdma_to_vf(adapt);
+	else
+		mi300_nbio_assign_sdma_to_vf(adapt);
+
+cleanup:
+	if (ret) {
+		/* These are idempotent and also cover failures after reset response. */
+		mi300_reset_restore_pf(adapt, reset_state);
+		amdgv_reset_restore_sriov(adapt);
+		tmp = bit_s3_int & ~ATOM_S3_ASIC_GUI_ENGINE_HUNG;
+		WREG32(SOC15_REG_OFFSET(NBIO, 0, regBIF_BX0_SBIOS_SCRATCH_3), tmp);
+		mi300_reset_restore_access_info(adapt, &access_info);
+	}
 	oss_free(reset_state);
 
 	if (ret)
@@ -1065,6 +1134,7 @@ static int mi300_gpu_reset_and_reinit(struct amdgv_adapter *adapt)
 	struct mi300_reset_access_info access_info;
 	struct mi300_whole_gpu_reset_state *reset_state;
 	struct amdgv_hive_info *hive;
+	bool pf_restored = false;
 
 	/* alloc memory for whole GPU reset */
 	reset_state = oss_zalloc(sizeof(struct mi300_whole_gpu_reset_state));
@@ -1133,12 +1203,18 @@ static int mi300_gpu_reset_and_reinit(struct amdgv_adapter *adapt)
 		amdgv_ras_intr_cleared();
 
 	mi300_reset_restore_pf(adapt, reset_state);
+	amdgv_reset_restore_sriov(adapt);
+	pf_restored = true;
 
 	/*check mode1 reset finish after restore_pci_config*/
 	ret = mi300_wait_gpu_reset_completion(adapt);
 	if (ret) {
 		goto exit;
 	}
+
+	ret = mi300_psp_wait_for_bootloader_steady_serialized(adapt);
+	if (ret)
+		goto exit;
 
 	/* disable S3 engine hung state */
 	tmp = bit_s3_int & ~ATOM_S3_ASIC_GUI_ENGINE_HUNG;
@@ -1176,6 +1252,13 @@ static int mi300_gpu_reset_and_reinit(struct amdgv_adapter *adapt)
 	mi300_reset_restore_access_info(adapt, &access_info);
 
 exit:
+	if (ret) {
+		if (!pf_restored) {
+			mi300_reset_restore_pf(adapt, reset_state);
+			amdgv_reset_restore_sriov(adapt);
+		}
+		mi300_reset_restore_access_info(adapt, &access_info);
+	}
 	oss_free(reset_state);
 
 	if (ret)

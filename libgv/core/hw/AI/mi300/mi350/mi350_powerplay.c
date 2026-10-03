@@ -544,8 +544,6 @@ bool mi350_smu_get_fw_loaded_status(struct amdgv_adapter *adapt)
 int mi350_gpu_mode1_reset(struct amdgv_adapter *adapt, bool is_unload)
 {
 	uint32_t fatal_err = 0, param;
-	struct amdgv_hive_info *hive;
-	hive = amdgv_get_xgmi_hive(adapt);
 
 	/* send mode1 reset command to SMU (MP1) */
 	AMDGV_DEBUG("sending mode1_reset command to SMU ...\n");
@@ -563,17 +561,14 @@ int mi350_gpu_mode1_reset(struct amdgv_adapter *adapt, bool is_unload)
 	 */
 	mi350_smu_send_msg_nocheck(adapt, PPSMC_MSG_GfxDriverReset, param);
 
-	/* if not unload, wait steady state.
-	 * if no hive, wait steady state;
-	 * if has hvie, wait steady state on the last gpu fini.
+	/*
+	 * The mode-1 reset blocks MMIO access until the PF PCI configuration
+	 * is restored.  Waiting for PSP bootloader state here therefore races
+	 * the reset restore path and can time out with the device inaccessible.
+	 * The caller waits for the reset response after restoring the PF config
+	 * and then checks PSP bootloader state.
 	 */
-	if ((!is_unload) || (hive == NULL) || ((hive != NULL) && (hive->number_adapters == 0))) {
-		/* allow time for all blocks to complete RESET */
-		if (mi300_psp_wait_for_bootloader_steady(adapt) != PSP_STATUS__SUCCESS) {
-			AMDGV_ERROR("mode1_reset timed out\n");
-			return AMDGV_FAILURE;
-			}
-	}
+	(void)is_unload;
 
 	oss_atomic_set(adapt->in_sync_flood, 0);
 
